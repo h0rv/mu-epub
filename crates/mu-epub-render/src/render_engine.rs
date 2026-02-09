@@ -478,9 +478,12 @@ impl LayoutSession<'_> {
             let rendered = &mut self.rendered_pages;
             let pending = &mut self.pending_pages;
             let page_index = &mut self.page_index;
+            let capture_for_cache = self.cfg.cache.is_some();
             inner.push_item_with_pages(item, &mut |mut page| {
                 RenderEngine::annotate_page_for_chapter(&mut page, chapter);
-                rendered.push(page.clone());
+                if capture_for_cache {
+                    rendered.push(page.clone());
+                }
                 if page_in_range(*page_index, &range) {
                     pending.push_back(page);
                 }
@@ -515,9 +518,12 @@ impl LayoutSession<'_> {
             let rendered = &mut self.rendered_pages;
             let pending = &mut self.pending_pages;
             let page_index = &mut self.page_index;
+            let capture_for_cache = self.cfg.cache.is_some();
             inner.finish(&mut |mut page| {
                 RenderEngine::annotate_page_for_chapter(&mut page, chapter);
-                rendered.push(page.clone());
+                if capture_for_cache {
+                    rendered.push(page.clone());
+                }
                 if page_in_range(*page_index, &range) {
                     pending.push_back(page);
                 }
