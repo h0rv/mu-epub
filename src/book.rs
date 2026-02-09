@@ -27,6 +27,7 @@ use crate::render_prep::{
     StylesheetSource,
 };
 use crate::spine::Spine;
+use crate::streaming::StreamingStats;
 use crate::tokenizer::{tokenize_html, Token};
 use crate::zip::{CdEntry, StreamingZip, ZipLimits};
 
@@ -98,6 +99,69 @@ impl Default for ChapterEventsOptions {
             max_items: 131_072,
         }
     }
+}
+
+/// Options for streaming chapter event processing without full materialization.
+///
+/// This provides true streaming from ZIP with configurable chunk sizes and limits.
+#[derive(Clone, Debug)]
+pub struct StreamingChapterOptions {
+    /// Render-prep options for styling.
+    pub render_prep: RenderPrepOptions,
+    /// Hard cap on emitted items.
+    pub max_items: usize,
+    /// Maximum chapter entry size in bytes.
+    pub max_entry_bytes: usize,
+    /// Chunk size limits for incremental processing.
+    pub chunk_limits: Option<crate::streaming::ChunkLimits>,
+    /// Whether to extract stylesheets (requires additional reads).
+    pub load_stylesheets: bool,
+}
+
+impl Default for StreamingChapterOptions {
+    fn default() -> Self {
+        Self {
+            render_prep: RenderPrepOptions::default(),
+            max_items: 131_072,
+            max_entry_bytes: 4 * 1024 * 1024, // 4MB default
+            chunk_limits: None,               // Use defaults
+            load_stylesheets: false,          // Skip stylesheets for speed
+        }
+    }
+}
+
+impl StreamingChapterOptions {
+    /// Create embedded-friendly options with small chunks.
+    pub fn embedded() -> Self {
+        Self {
+            render_prep: RenderPrepOptions::default(),
+            max_items: 10_000,
+            max_entry_bytes: 512 * 1024, // 512KB max
+            chunk_limits: Some(crate::streaming::ChunkLimits::embedded()),
+            load_stylesheets: false,
+        }
+    }
+
+    /// Set explicit chunk limits.
+    pub fn with_chunk_limits(mut self, limits: crate::streaming::ChunkLimits) -> Self {
+        self.chunk_limits = Some(limits);
+        self
+    }
+
+    /// Enable/disable stylesheet loading.
+    pub fn with_stylesheets(mut self, load: bool) -> Self {
+        self.load_stylesheets = load;
+        self
+    }
+}
+
+/// Result from streaming chapter processing.
+#[derive(Clone, Debug)]
+pub struct StreamingResult {
+    /// Number of items emitted.
+    pub items_emitted: usize,
+    /// Processing statistics.
+    pub stats: StreamingStats,
 }
 
 /// Builder for ergonomic high-level EPUB opening/parsing.

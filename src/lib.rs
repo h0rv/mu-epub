@@ -34,6 +34,7 @@ pub mod error;
 pub mod metadata;
 pub mod navigation;
 pub mod spine;
+pub mod streaming;
 pub mod tokenizer;
 
 #[cfg(feature = "layout")]
@@ -79,6 +80,10 @@ pub use render_prep::{
 };
 pub use spine::Spine;
 pub use tokenizer::{Token, TokenizeError, TokenizeLimits, tokenize_html_limited};
+pub use streaming::{
+    ChunkAllocator, ChunkLimits, PaginationContext, ScratchBuffers,
+    StreamingChapterProcessor, StreamingStats,
+};
 #[cfg(feature = "std")]
 pub use validate::{
     validate_epub_file, validate_epub_file_with_options, validate_epub_reader,
