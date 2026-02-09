@@ -28,6 +28,8 @@ pub struct ZipLimits {
     pub max_mimetype_size: usize,
     /// Whether ZIP parsing should fail on strict structural issues.
     pub strict: bool,
+    /// Maximum bytes scanned from file tail while searching for EOCD.
+    pub max_eocd_scan: usize,
 }
 
 impl ZipLimits {
@@ -37,12 +39,19 @@ impl ZipLimits {
             max_file_read_size,
             max_mimetype_size,
             strict: false,
+            max_eocd_scan: MAX_EOCD_SCAN,
         }
     }
 
     /// Enable or disable strict ZIP parsing behavior.
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Set a cap for EOCD tail scan bytes.
+    pub fn with_max_eocd_scan(mut self, max_eocd_scan: usize) -> Self {
+        self.max_eocd_scan = max_eocd_scan.max(EOCD_MIN_SIZE);
         self
     }
 }
@@ -129,7 +138,10 @@ impl<F: Read + Seek> StreamingZip<F> {
     /// Open a ZIP file with explicit runtime limits.
     pub fn new_with_limits(mut file: F, limits: Option<ZipLimits>) -> Result<Self, ZipError> {
         // Find and parse EOCD
-        let eocd = Self::find_eocd(&mut file)?;
+        let max_eocd_scan = limits
+            .map(|l| l.max_eocd_scan.min(MAX_EOCD_SCAN))
+            .unwrap_or(MAX_EOCD_SCAN);
+        let eocd = Self::find_eocd(&mut file, max_eocd_scan)?;
         if eocd.uses_zip64 {
             return Err(ZipError::UnsupportedZip64);
         }
@@ -186,7 +198,7 @@ impl<F: Read + Seek> StreamingZip<F> {
     }
 
     /// Find EOCD and extract central directory info
-    fn find_eocd(file: &mut F) -> Result<EocdInfo, ZipError> {
+    fn find_eocd(file: &mut F, max_eocd_scan: usize) -> Result<EocdInfo, ZipError> {
         // Get file size
         let file_size = file.seek(SeekFrom::End(0)).map_err(|_| ZipError::IoError)?;
 
@@ -195,7 +207,7 @@ impl<F: Read + Seek> StreamingZip<F> {
         }
 
         // Scan last (EOCD + max comment) bytes for EOCD signature.
-        let scan_range = file_size.min(MAX_EOCD_SCAN as u64) as usize;
+        let scan_range = file_size.min(max_eocd_scan as u64) as usize;
         let mut buffer = alloc::vec![0u8; scan_range];
 
         file.seek(SeekFrom::Start(file_size - scan_range as u64))
@@ -820,6 +832,18 @@ mod tests {
         let cursor = std::io::Cursor::new(zip_data);
         let mut zip = StreamingZip::new(cursor).expect("EOCD should be discoverable");
         assert!(zip.validate_mimetype().is_ok());
+    }
+
+    #[test]
+    fn test_eocd_scan_limit_rejects_long_tail() {
+        let zip_data = add_zip_comment(
+            build_single_file_zip("mimetype", b"application/epub+zip"),
+            2_000,
+        );
+        let cursor = std::io::Cursor::new(zip_data);
+        let limits = ZipLimits::new(1024 * 1024, 1024).with_max_eocd_scan(128);
+        let result = StreamingZip::new_with_limits(cursor, Some(limits));
+        assert!(matches!(result, Err(ZipError::InvalidFormat)));
     }
 
     #[test]
