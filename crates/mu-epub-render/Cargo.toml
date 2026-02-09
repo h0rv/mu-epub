@@ -1,0 +1,10 @@
+[package]
+name = "mu-epub-render"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Render IR and layout engine for mu-epub"
+
+[dependencies]
+mu_epub = { path = "../.." }

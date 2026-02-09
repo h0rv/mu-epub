@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    ".",
+    "crates/mu-epub-render",
+    "crates/mu-epub-embedded-graphics",
+]
+resolver = "2"
+
+[package]
+name = "mu_epub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Robby Horvath"]
+license = "MIT"
+description = "Memory-efficient EPUB parser for embedded systems"
+keywords = ["epub", "ebook", "embedded", "parser", "no_std"]
+categories = ["parsing", "embedded", "no-std"]
+readme = "README.md"
+exclude = ["tests/fixtures/"]
+
+[features]
+default = ["std"]
+std = ["dep:miniz_oxide", "dep:heapless", "dep:crc32fast", "dep:log"]
+layout = []
+async = ["std", "dep:tokio"]
+cli = ["std"]
+
+[dependencies]
+quick-xml = { version = "0.39", default-features = false }
+miniz_oxide = { version = "0.9", default-features = false, optional = true }
+heapless = { version = "0.9", optional = true }
+crc32fast = { version = "1", default-features = false, optional = true }
+log = { version = "0.4", default-features = false, optional = true }
+tokio = { version = "1", features = ["fs"], optional = true }
+
+[dev-dependencies]
+epub = "2.1.5"
+epub-parser = "0.3.4"
+
+[[bench]]
+name = "epub_bench"
+harness = false
+
+[[bin]]
+name = "mu-epub"
+path = "src/bin/mu-epub.rs"
+required-features = ["cli"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

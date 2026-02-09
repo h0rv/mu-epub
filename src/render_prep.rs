@@ -1,0 +1,1941 @@
+//! Stream-first style/font preparation APIs for rendering pipelines.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+
+use crate::book::EpubBook;
+use crate::css::{
+    parse_inline_style, parse_stylesheet, CssStyle, FontSize, FontStyle, FontWeight, LineHeight,
+    Stylesheet,
+};
+use crate::error::EpubError;
+
+/// Limits for stylesheet parsing and application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StyleLimits {
+    /// Maximum number of stylesheet rules to process.
+    pub max_selectors: usize,
+    /// Maximum bytes read for any individual stylesheet.
+    pub max_css_bytes: usize,
+    /// Maximum supported list nesting depth (reserved for downstream layout usage).
+    pub max_nesting: usize,
+}
+
+impl Default for StyleLimits {
+    fn default() -> Self {
+        Self {
+            max_selectors: 4096,
+            max_css_bytes: 512 * 1024,
+            max_nesting: 32,
+        }
+    }
+}
+
+/// Limits for embedded font enumeration and registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontLimits {
+    /// Maximum number of font faces accepted.
+    pub max_faces: usize,
+    /// Maximum bytes for any one font file.
+    pub max_bytes_per_font: usize,
+    /// Maximum total bytes across all registered font files.
+    pub max_total_font_bytes: usize,
+}
+
+impl Default for FontLimits {
+    fn default() -> Self {
+        Self {
+            max_faces: 64,
+            max_bytes_per_font: 8 * 1024 * 1024,
+            max_total_font_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Safe layout hint clamps for text style normalization.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutHints {
+    /// Default base font size in pixels.
+    pub base_font_size_px: f32,
+    /// Lower clamp for effective font size.
+    pub min_font_size_px: f32,
+    /// Upper clamp for effective font size.
+    pub max_font_size_px: f32,
+    /// Lower clamp for effective line-height multiplier.
+    pub min_line_height: f32,
+    /// Upper clamp for effective line-height multiplier.
+    pub max_line_height: f32,
+}
+
+impl Default for LayoutHints {
+    fn default() -> Self {
+        Self {
+            base_font_size_px: 16.0,
+            min_font_size_px: 10.0,
+            max_font_size_px: 42.0,
+            min_line_height: 1.1,
+            max_line_height: 2.2,
+        }
+    }
+}
+
+/// Style engine options.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StyleConfig {
+    /// Hard parsing limits.
+    pub limits: StyleLimits,
+    /// Normalization and clamp hints.
+    pub hints: LayoutHints,
+}
+
+/// Render-prep orchestration options.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderPrepOptions {
+    /// Stylesheet parsing and resolution options.
+    pub style: StyleConfig,
+    /// Font registration limits.
+    pub fonts: FontLimits,
+    /// Final style normalization hints.
+    pub layout_hints: LayoutHints,
+}
+
+/// Structured error for style/font preparation operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderPrepError {
+    /// Stable machine-readable code.
+    pub code: &'static str,
+    /// Human-readable message.
+    pub message: Box<str>,
+    /// Optional archive path context.
+    pub path: Option<Box<str>>,
+    /// Optional additional context.
+    pub context: Option<Box<RenderPrepErrorContext>>,
+}
+
+/// Extended optional context for render-prep errors.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderPrepErrorContext {
+    /// Optional source context (stylesheet href, inline style location, tokenizer phase).
+    pub source: Option<Box<str>>,
+    /// Optional selector context.
+    pub selector: Option<Box<str>>,
+    /// Optional selector index for structured consumers.
+    pub selector_index: Option<usize>,
+    /// Optional declaration context.
+    pub declaration: Option<Box<str>>,
+    /// Optional declaration index for structured consumers.
+    pub declaration_index: Option<usize>,
+    /// Optional tokenizer/read offset in bytes.
+    pub token_offset: Option<usize>,
+}
+
+impl RenderPrepError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into().into_boxed_str(),
+            path: None,
+            context: None,
+        }
+    }
+
+    fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into().into_boxed_str());
+        self
+    }
+
+    fn with_source(mut self, source: impl Into<String>) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.source = Some(source.into().into_boxed_str());
+        self
+    }
+
+    fn with_selector(mut self, selector: impl Into<String>) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.selector = Some(selector.into().into_boxed_str());
+        self
+    }
+
+    fn with_selector_index(mut self, selector_index: usize) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.selector_index = Some(selector_index);
+        self
+    }
+
+    fn with_declaration(mut self, declaration: impl Into<String>) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.declaration = Some(declaration.into().into_boxed_str());
+        self
+    }
+
+    fn with_declaration_index(mut self, declaration_index: usize) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.declaration_index = Some(declaration_index);
+        self
+    }
+
+    fn with_token_offset(mut self, token_offset: usize) -> Self {
+        let ctx = self
+            .context
+            .get_or_insert_with(|| Box::new(RenderPrepErrorContext::default()));
+        ctx.token_offset = Some(token_offset);
+        self
+    }
+}
+
+impl fmt::Display for RenderPrepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)?;
+        if let Some(path) = self.path.as_deref() {
+            write!(f, " [path={}]", path)?;
+        }
+        if let Some(ctx) = &self.context {
+            if let Some(source) = ctx.source.as_deref() {
+                write!(f, " [source={}]", source)?;
+            }
+            if let Some(selector) = ctx.selector.as_deref() {
+                write!(f, " [selector={}]", selector)?;
+            }
+            if let Some(selector_index) = ctx.selector_index {
+                write!(f, " [selector_index={}]", selector_index)?;
+            }
+            if let Some(declaration) = ctx.declaration.as_deref() {
+                write!(f, " [declaration={}]", declaration)?;
+            }
+            if let Some(declaration_index) = ctx.declaration_index {
+                write!(f, " [declaration_index={}]", declaration_index)?;
+            }
+            if let Some(token_offset) = ctx.token_offset {
+                write!(f, " [token_offset={}]", token_offset)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RenderPrepError {}
+
+/// Source stylesheet payload in chapter cascade order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StylesheetSource {
+    /// Archive path or inline marker for this stylesheet.
+    pub href: String,
+    /// Raw CSS bytes decoded as UTF-8.
+    pub css: String,
+}
+
+/// Collection of resolved stylesheet sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapterStylesheets {
+    /// Sources in cascade order.
+    pub sources: Vec<StylesheetSource>,
+}
+
+impl ChapterStylesheets {
+    /// Iterate all stylesheet sources.
+    pub fn iter(&self) -> impl Iterator<Item = &StylesheetSource> {
+        self.sources.iter()
+    }
+}
+
+/// Font style descriptor for `@font-face` metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedFontStyle {
+    /// Upright style.
+    Normal,
+    /// Italic style.
+    Italic,
+    /// Oblique style.
+    Oblique,
+}
+
+/// Embedded font face metadata extracted from EPUB CSS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedFontFace {
+    /// Requested font family from `@font-face`.
+    pub family: String,
+    /// Numeric weight (e.g. 400, 700).
+    pub weight: u16,
+    /// Style variant.
+    pub style: EmbeddedFontStyle,
+    /// Optional stretch descriptor.
+    pub stretch: Option<String>,
+    /// OPF-relative href to font resource.
+    pub href: String,
+    /// Optional format hint from `format(...)`.
+    pub format: Option<String>,
+}
+
+/// Semantic block role for computed styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockRole {
+    /// Body text.
+    Body,
+    /// Paragraph block.
+    Paragraph,
+    /// Heading block by level.
+    Heading(u8),
+    /// List item block.
+    ListItem,
+}
+
+/// Cascaded and normalized text style for rendering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputedTextStyle {
+    /// Ordered family preference stack.
+    pub family_stack: Vec<String>,
+    /// Numeric weight.
+    pub weight: u16,
+    /// Italic toggle.
+    pub italic: bool,
+    /// Effective font size in pixels.
+    pub size_px: f32,
+    /// Effective line-height multiplier.
+    pub line_height: f32,
+    /// Effective letter spacing in pixels.
+    pub letter_spacing: f32,
+    /// Semantic block role.
+    pub block_role: BlockRole,
+}
+
+/// Styled text run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyledRun {
+    /// Run text payload.
+    pub text: String,
+    /// Computed style for this run.
+    pub style: ComputedTextStyle,
+    /// Stable resolved font identity (0 means policy fallback).
+    pub font_id: u32,
+    /// Resolved family selected by the font resolver.
+    pub resolved_family: String,
+}
+
+/// Structured block/layout events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyledEvent {
+    /// Paragraph starts.
+    ParagraphStart,
+    /// Paragraph ends.
+    ParagraphEnd,
+    /// Heading starts.
+    HeadingStart(u8),
+    /// Heading ends.
+    HeadingEnd(u8),
+    /// List item starts.
+    ListItemStart,
+    /// List item ends.
+    ListItemEnd,
+    /// Explicit line break.
+    LineBreak,
+}
+
+/// Stream item for styled output.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StyledEventOrRun {
+    /// Structural event.
+    Event(StyledEvent),
+    /// Styled text run.
+    Run(StyledRun),
+}
+
+/// Styled chapter output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StyledChapter {
+    items: Vec<StyledEventOrRun>,
+}
+
+impl StyledChapter {
+    /// Iterate full event/run stream.
+    pub fn iter(&self) -> impl Iterator<Item = &StyledEventOrRun> {
+        self.items.iter()
+    }
+
+    /// Iterate only text runs.
+    pub fn runs(&self) -> impl Iterator<Item = &StyledRun> {
+        self.items.iter().filter_map(|item| match item {
+            StyledEventOrRun::Run(run) => Some(run),
+            _ => None,
+        })
+    }
+
+    /// Build from a pre-collected item vector.
+    pub fn from_items(items: Vec<StyledEventOrRun>) -> Self {
+        Self { items }
+    }
+}
+
+/// Lightweight style system with CSS cascade resolution.
+#[derive(Clone, Debug)]
+pub struct Styler {
+    config: StyleConfig,
+    parsed: Vec<Stylesheet>,
+}
+
+impl Styler {
+    /// Create a styler with explicit config.
+    pub fn new(config: StyleConfig) -> Self {
+        Self {
+            config,
+            parsed: Vec::new(),
+        }
+    }
+
+    /// Parse and load stylesheets in cascade order.
+    pub fn load_stylesheets(
+        &mut self,
+        sources: &ChapterStylesheets,
+    ) -> Result<(), RenderPrepError> {
+        self.parsed.clear();
+        for source in &sources.sources {
+            if source.css.len() > self.config.limits.max_css_bytes {
+                let err = RenderPrepError::new(
+                    "STYLE_CSS_TOO_LARGE",
+                    format!(
+                        "Stylesheet exceeds max_css_bytes ({} > {})",
+                        source.css.len(),
+                        self.config.limits.max_css_bytes
+                    ),
+                )
+                .with_path(source.href.clone())
+                .with_source(source.href.clone());
+                return Err(err);
+            }
+            let parsed = parse_stylesheet(&source.css).map_err(|e| {
+                RenderPrepError::new(
+                    "STYLE_PARSE_ERROR",
+                    format!("Failed to parse stylesheet: {}", e),
+                )
+                .with_path(source.href.clone())
+                .with_source(source.href.clone())
+            })?;
+            if parsed.len() > self.config.limits.max_selectors {
+                let err = RenderPrepError::new(
+                    "STYLE_SELECTOR_LIMIT",
+                    format!(
+                        "Stylesheet exceeds max_selectors ({} > {})",
+                        parsed.len(),
+                        self.config.limits.max_selectors
+                    ),
+                )
+                .with_selector(format!("selector_count={}", parsed.len()))
+                .with_selector_index(self.config.limits.max_selectors)
+                .with_path(source.href.clone())
+                .with_source(source.href.clone());
+                return Err(err);
+            }
+            self.parsed.push(parsed);
+        }
+        Ok(())
+    }
+
+    /// Style a chapter and return a stream of events and runs.
+    pub fn style_chapter(&self, html: &str) -> Result<StyledChapter, RenderPrepError> {
+        let mut items = Vec::new();
+        self.style_chapter_with(html, |item| items.push(item))?;
+        Ok(StyledChapter { items })
+    }
+
+    /// Style a chapter and append results into an output buffer.
+    pub fn style_chapter_into(
+        &self,
+        html: &str,
+        out: &mut Vec<StyledEventOrRun>,
+    ) -> Result<(), RenderPrepError> {
+        self.style_chapter_with(html, |item| out.push(item))
+    }
+
+    /// Style a chapter and stream each item to a callback.
+    pub fn style_chapter_with<F>(&self, html: &str, mut on_item: F) -> Result<(), RenderPrepError>
+    where
+        F: FnMut(StyledEventOrRun),
+    {
+        let mut reader = Reader::from_str(html);
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
+        let mut stack: Vec<ElementCtx> = Vec::new();
+        let mut skip_depth = 0usize;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let tag = decode_tag_name(&reader, e.name().as_ref())?;
+                    if should_skip_tag(&tag) {
+                        skip_depth += 1;
+                        buf.clear();
+                        continue;
+                    }
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    let ctx = element_ctx_from_start(&reader, &e)?;
+                    emit_start_event(&ctx.tag, &mut on_item);
+                    stack.push(ctx);
+                }
+                Ok(Event::Empty(e)) => {
+                    let tag = decode_tag_name(&reader, e.name().as_ref())?;
+                    if skip_depth > 0 || should_skip_tag(&tag) {
+                        buf.clear();
+                        continue;
+                    }
+                    let ctx = element_ctx_from_start(&reader, &e)?;
+                    emit_start_event(&ctx.tag, &mut on_item);
+                    if ctx.tag == "br" {
+                        on_item(StyledEventOrRun::Event(StyledEvent::LineBreak));
+                    }
+                    emit_end_event(&ctx.tag, &mut on_item);
+                }
+                Ok(Event::End(e)) => {
+                    let tag = decode_tag_name(&reader, e.name().as_ref())?;
+                    if should_skip_tag(&tag) {
+                        skip_depth = skip_depth.saturating_sub(1);
+                        buf.clear();
+                        continue;
+                    }
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    emit_end_event(&tag, &mut on_item);
+                    if !stack.is_empty() {
+                        stack.pop();
+                    }
+                }
+                Ok(Event::Text(e)) => {
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    let text = e
+                        .decode()
+                        .map_err(|err| {
+                            RenderPrepError::new(
+                                "STYLE_TOKENIZE_ERROR",
+                                format!("Decode error: {:?}", err),
+                            )
+                            .with_source("text node decode")
+                            .with_token_offset(reader_token_offset(&reader))
+                        })?
+                        .to_string();
+                    let preserve_ws = is_preformatted_context(&stack);
+                    let normalized = normalize_plain_text_whitespace(&text, preserve_ws);
+                    if normalized.is_empty() {
+                        buf.clear();
+                        continue;
+                    }
+                    let (resolved, role, bold_tag, italic_tag) = self.resolve_context_style(&stack);
+                    let style = self.compute_style(resolved, role, bold_tag, italic_tag);
+                    on_item(StyledEventOrRun::Run(StyledRun {
+                        text: normalized,
+                        style,
+                        font_id: 0,
+                        resolved_family: String::new(),
+                    }));
+                }
+                Ok(Event::CData(e)) => {
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    let text = reader
+                        .decoder()
+                        .decode(&e)
+                        .map_err(|err| {
+                            RenderPrepError::new(
+                                "STYLE_TOKENIZE_ERROR",
+                                format!("Decode error: {:?}", err),
+                            )
+                            .with_source("cdata decode")
+                            .with_token_offset(reader_token_offset(&reader))
+                        })?
+                        .to_string();
+                    let preserve_ws = is_preformatted_context(&stack);
+                    let normalized = normalize_plain_text_whitespace(&text, preserve_ws);
+                    if normalized.is_empty() {
+                        buf.clear();
+                        continue;
+                    }
+                    let (resolved, role, bold_tag, italic_tag) = self.resolve_context_style(&stack);
+                    let style = self.compute_style(resolved, role, bold_tag, italic_tag);
+                    on_item(StyledEventOrRun::Run(StyledRun {
+                        text: normalized,
+                        style,
+                        font_id: 0,
+                        resolved_family: String::new(),
+                    }));
+                }
+                Ok(Event::GeneralRef(e)) => {
+                    if skip_depth > 0 {
+                        buf.clear();
+                        continue;
+                    }
+                    let entity_name = e.decode().map_err(|err| {
+                        RenderPrepError::new(
+                            "STYLE_TOKENIZE_ERROR",
+                            format!("Decode error: {:?}", err),
+                        )
+                        .with_source("entity decode")
+                        .with_token_offset(reader_token_offset(&reader))
+                    })?;
+                    let entity = format!("&{};", entity_name);
+                    let resolved_entity = quick_xml::escape::unescape(&entity)
+                        .map_err(|err| {
+                            RenderPrepError::new(
+                                "STYLE_TOKENIZE_ERROR",
+                                format!("Unescape error: {:?}", err),
+                            )
+                            .with_source("entity unescape")
+                            .with_token_offset(reader_token_offset(&reader))
+                        })?
+                        .to_string();
+                    let preserve_ws = is_preformatted_context(&stack);
+                    let normalized = normalize_plain_text_whitespace(&resolved_entity, preserve_ws);
+                    if normalized.is_empty() {
+                        buf.clear();
+                        continue;
+                    }
+                    let (resolved, role, bold_tag, italic_tag) = self.resolve_context_style(&stack);
+                    let style = self.compute_style(resolved, role, bold_tag, italic_tag);
+                    on_item(StyledEventOrRun::Run(StyledRun {
+                        text: normalized,
+                        style,
+                        font_id: 0,
+                        resolved_family: String::new(),
+                    }));
+                }
+                Ok(Event::Eof) => break,
+                Ok(_) => {}
+                Err(err) => {
+                    return Err(RenderPrepError::new(
+                        "STYLE_TOKENIZE_ERROR",
+                        format!("XML error: {:?}", err),
+                    )
+                    .with_source("xml tokenizer")
+                    .with_token_offset(reader_token_offset(&reader)));
+                }
+            }
+            buf.clear();
+        }
+
+        Ok(())
+    }
+
+    fn resolve_tag_style(&self, tag: &str, classes: &[String]) -> CssStyle {
+        let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let mut style = CssStyle::new();
+        for ss in &self.parsed {
+            style.merge(&ss.resolve(tag, &class_refs));
+        }
+        style
+    }
+
+    fn compute_style(
+        &self,
+        resolved: CssStyle,
+        role: BlockRole,
+        bold_tag: bool,
+        italic_tag: bool,
+    ) -> ComputedTextStyle {
+        let mut size_px = match resolved.font_size {
+            Some(FontSize::Px(px)) => px,
+            Some(FontSize::Em(em)) => self.config.hints.base_font_size_px * em,
+            None => {
+                if matches!(role, BlockRole::Heading(1 | 2)) {
+                    self.config.hints.base_font_size_px * 1.25
+                } else {
+                    self.config.hints.base_font_size_px
+                }
+            }
+        };
+        size_px = size_px.clamp(
+            self.config.hints.min_font_size_px,
+            self.config.hints.max_font_size_px,
+        );
+
+        let mut line_height = match resolved.line_height {
+            Some(LineHeight::Px(px)) => (px / size_px).max(1.0),
+            Some(LineHeight::Multiplier(m)) => m,
+            None => 1.4,
+        };
+        line_height = line_height.clamp(
+            self.config.hints.min_line_height,
+            self.config.hints.max_line_height,
+        );
+
+        let weight = match resolved.font_weight.unwrap_or(FontWeight::Normal) {
+            FontWeight::Bold => 700,
+            FontWeight::Normal => 400,
+        };
+        let italic = matches!(
+            resolved.font_style.unwrap_or(FontStyle::Normal),
+            FontStyle::Italic
+        );
+        let final_weight = if bold_tag { 700 } else { weight };
+        let final_italic = italic || italic_tag;
+
+        let family_stack = resolved
+            .font_family
+            .as_ref()
+            .map(|fam| split_family_stack(fam))
+            .unwrap_or_else(|| vec!["serif".to_string()]);
+
+        ComputedTextStyle {
+            family_stack,
+            weight: final_weight,
+            italic: final_italic,
+            size_px,
+            line_height,
+            letter_spacing: 0.0,
+            block_role: role,
+        }
+    }
+
+    fn resolve_context_style(&self, stack: &[ElementCtx]) -> (CssStyle, BlockRole, bool, bool) {
+        let mut merged = CssStyle::new();
+        let mut role = BlockRole::Body;
+        let mut bold_tag = false;
+        let mut italic_tag = false;
+
+        for ctx in stack {
+            merged.merge(&self.resolve_tag_style(&ctx.tag, &ctx.classes));
+            if let Some(inline) = &ctx.inline_style {
+                merged.merge(inline);
+            }
+            if matches!(ctx.tag.as_str(), "strong" | "b") {
+                bold_tag = true;
+            }
+            if matches!(ctx.tag.as_str(), "em" | "i") {
+                italic_tag = true;
+            }
+            role = role_from_tag(&ctx.tag).unwrap_or(role);
+        }
+
+        (merged, role, bold_tag, italic_tag)
+    }
+}
+
+/// Fallback policy for font matching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontPolicy {
+    /// Preferred family order used when style stack has no embedded match.
+    pub preferred_families: Vec<String>,
+    /// Final fallback family.
+    pub default_family: String,
+    /// Whether embedded fonts are allowed for matching.
+    pub allow_embedded_fonts: bool,
+    /// Whether synthetic bold is allowed.
+    pub synthetic_bold: bool,
+    /// Whether synthetic italic is allowed.
+    pub synthetic_italic: bool,
+}
+
+impl FontPolicy {
+    /// Serif-first policy.
+    pub fn serif_default() -> Self {
+        Self {
+            preferred_families: vec!["serif".to_string()],
+            default_family: "serif".to_string(),
+            allow_embedded_fonts: true,
+            synthetic_bold: false,
+            synthetic_italic: false,
+        }
+    }
+}
+
+/// First-class public fallback policy alias.
+pub type FontFallbackPolicy = FontPolicy;
+
+impl Default for FontPolicy {
+    fn default() -> Self {
+        Self::serif_default()
+    }
+}
+
+/// Resolved font face for a style request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedFontFace {
+    /// Stable resolver identity for the chosen face (0 means policy fallback face).
+    pub font_id: u32,
+    /// Chosen family.
+    pub family: String,
+    /// Selected face metadata when matched in EPUB.
+    pub embedded: Option<EmbeddedFontFace>,
+}
+
+/// Trace output for fallback reasoning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontResolutionTrace {
+    /// Final selected face.
+    pub face: ResolvedFontFace,
+    /// Resolution reasoning chain.
+    pub reason_chain: Vec<String>,
+}
+
+/// Font resolution engine.
+#[derive(Clone, Debug)]
+pub struct FontResolver {
+    policy: FontPolicy,
+    limits: FontLimits,
+    faces: Vec<EmbeddedFontFace>,
+}
+
+impl FontResolver {
+    /// Create a resolver with explicit policy and limits.
+    pub fn new(policy: FontPolicy) -> Self {
+        Self {
+            policy,
+            limits: FontLimits::default(),
+            faces: Vec::new(),
+        }
+    }
+
+    /// Override registration limits.
+    pub fn with_limits(mut self, limits: FontLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Register EPUB fonts and validate byte limits via callback.
+    pub fn register_epub_fonts<I, F>(
+        &mut self,
+        fonts: I,
+        mut loader: F,
+    ) -> Result<(), RenderPrepError>
+    where
+        I: IntoIterator<Item = EmbeddedFontFace>,
+        F: FnMut(&str) -> Result<Vec<u8>, EpubError>,
+    {
+        self.faces.clear();
+        let mut total = 0usize;
+        let mut dedupe_keys: Vec<(String, u16, EmbeddedFontStyle, String)> = Vec::new();
+
+        for face in fonts {
+            let normalized_family = normalize_family(&face.family);
+            let dedupe_key = (
+                normalized_family,
+                face.weight,
+                face.style,
+                face.href.to_ascii_lowercase(),
+            );
+            if dedupe_keys.contains(&dedupe_key) {
+                continue;
+            }
+            if self.faces.len() >= self.limits.max_faces {
+                return Err(RenderPrepError::new(
+                    "FONT_FACE_LIMIT",
+                    "Too many embedded font faces",
+                ));
+            }
+            let bytes = loader(&face.href).map_err(|e| {
+                RenderPrepError::new("FONT_LOAD_ERROR", e.to_string()).with_path(face.href.clone())
+            })?;
+            if bytes.len() > self.limits.max_bytes_per_font {
+                let err = RenderPrepError::new(
+                    "FONT_BYTES_PER_FACE_LIMIT",
+                    format!(
+                        "Font exceeds max_bytes_per_font ({} > {})",
+                        bytes.len(),
+                        self.limits.max_bytes_per_font
+                    ),
+                )
+                .with_path(face.href.clone());
+                return Err(err);
+            }
+            total += bytes.len();
+            if total > self.limits.max_total_font_bytes {
+                return Err(RenderPrepError::new(
+                    "FONT_TOTAL_BYTES_LIMIT",
+                    format!(
+                        "Total font bytes exceed max_total_font_bytes ({} > {})",
+                        total, self.limits.max_total_font_bytes
+                    ),
+                ));
+            }
+            dedupe_keys.push(dedupe_key);
+            self.faces.push(face);
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a style request to a concrete face.
+    pub fn resolve(&self, style: &ComputedTextStyle) -> ResolvedFontFace {
+        self.resolve_with_trace(style).face
+    }
+
+    /// Resolve with full fallback reasoning.
+    pub fn resolve_with_trace(&self, style: &ComputedTextStyle) -> FontResolutionTrace {
+        self.resolve_with_trace_for_text(style, None)
+    }
+
+    /// Resolve with full fallback reasoning and optional text context.
+    pub fn resolve_with_trace_for_text(
+        &self,
+        style: &ComputedTextStyle,
+        text: Option<&str>,
+    ) -> FontResolutionTrace {
+        let mut reasons = Vec::new();
+        for family in &style.family_stack {
+            if !self.policy.allow_embedded_fonts {
+                reasons.push("embedded fonts disabled by policy".to_string());
+                break;
+            }
+            let requested = normalize_family(family);
+            let mut candidates: Vec<(usize, EmbeddedFontFace)> = self
+                .faces
+                .iter()
+                .enumerate()
+                .filter(|(_, face)| normalize_family(&face.family) == requested)
+                .map(|(idx, face)| (idx, face.clone()))
+                .collect();
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|(_, face)| {
+                    let weight_delta = (face.weight as i32 - style.weight as i32).unsigned_abs();
+                    let style_penalty = if style.italic {
+                        if matches!(
+                            face.style,
+                            EmbeddedFontStyle::Italic | EmbeddedFontStyle::Oblique
+                        ) {
+                            0
+                        } else {
+                            1000
+                        }
+                    } else if matches!(face.style, EmbeddedFontStyle::Normal) {
+                        0
+                    } else {
+                        1000
+                    };
+                    weight_delta + style_penalty
+                });
+                let (chosen_idx, chosen) = candidates[0].clone();
+                reasons.push(format!(
+                    "matched embedded family '{}' via nearest weight/style",
+                    family
+                ));
+                return FontResolutionTrace {
+                    face: ResolvedFontFace {
+                        font_id: chosen_idx as u32 + 1,
+                        family: chosen.family.clone(),
+                        embedded: Some(chosen),
+                    },
+                    reason_chain: reasons,
+                };
+            }
+            reasons.push(format!("family '{}' unavailable in embedded set", family));
+        }
+
+        for family in &self.policy.preferred_families {
+            reasons.push(format!("preferred fallback family candidate '{}'", family));
+        }
+        reasons.push(format!(
+            "fallback to policy default '{}'",
+            self.policy.default_family
+        ));
+        if text.is_some_and(has_non_ascii) {
+            reasons
+                .push("missing glyph risk: non-ASCII text with no embedded face match".to_string());
+        }
+        FontResolutionTrace {
+            face: ResolvedFontFace {
+                font_id: 0,
+                family: self.policy.default_family.clone(),
+                embedded: None,
+            },
+            reason_chain: reasons,
+        }
+    }
+}
+
+/// Render-prep orchestrator.
+#[derive(Clone, Debug)]
+pub struct RenderPrep {
+    opts: RenderPrepOptions,
+    styler: Styler,
+    font_resolver: FontResolver,
+}
+
+/// Structured trace context for a streamed chapter item.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RenderPrepTrace {
+    /// Non-text structural event.
+    Event,
+    /// Text run with style context and font-resolution trace.
+    Run {
+        /// Style used for this run during resolution.
+        style: Box<ComputedTextStyle>,
+        /// Font resolution details for this run.
+        font: Box<FontResolutionTrace>,
+    },
+}
+
+impl RenderPrepTrace {
+    /// Return font-resolution trace when this item is a text run.
+    pub fn font_trace(&self) -> Option<&FontResolutionTrace> {
+        match self {
+            Self::Run { font, .. } => Some(font.as_ref()),
+            Self::Event => None,
+        }
+    }
+
+    /// Return style context when this item is a text run.
+    pub fn style_context(&self) -> Option<&ComputedTextStyle> {
+        match self {
+            Self::Run { style, .. } => Some(style.as_ref()),
+            Self::Event => None,
+        }
+    }
+}
+
+impl RenderPrep {
+    /// Create a render-prep engine.
+    pub fn new(opts: RenderPrepOptions) -> Self {
+        let styler = Styler::new(opts.style);
+        let font_resolver = FontResolver::new(FontPolicy::default()).with_limits(opts.fonts);
+        Self {
+            opts,
+            styler,
+            font_resolver,
+        }
+    }
+
+    /// Use serif default fallback policy.
+    pub fn with_serif_default(mut self) -> Self {
+        self.font_resolver =
+            FontResolver::new(FontPolicy::serif_default()).with_limits(self.opts.fonts);
+        self
+    }
+
+    /// Register all embedded fonts from a book.
+    pub fn with_embedded_fonts_from_book<R: std::io::Read + std::io::Seek>(
+        self,
+        book: &mut EpubBook<R>,
+    ) -> Result<Self, RenderPrepError> {
+        let fonts = book
+            .embedded_fonts_with_options(self.opts.fonts)
+            .map_err(|e| RenderPrepError::new("BOOK_EMBEDDED_FONTS", e.to_string()))?;
+        self.with_registered_fonts(fonts, |href| book.read_resource(href))
+    }
+
+    /// Register fonts from any external source with a byte loader callback.
+    pub fn with_registered_fonts<I, F>(
+        mut self,
+        fonts: I,
+        mut loader: F,
+    ) -> Result<Self, RenderPrepError>
+    where
+        I: IntoIterator<Item = EmbeddedFontFace>,
+        F: FnMut(&str) -> Result<Vec<u8>, EpubError>,
+    {
+        self.font_resolver
+            .register_epub_fonts(fonts, |href| loader(href))?;
+        Ok(self)
+    }
+
+    /// Prepare a chapter into styled runs/events.
+    pub fn prepare_chapter<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        book: &mut EpubBook<R>,
+        index: usize,
+    ) -> Result<PreparedChapter, RenderPrepError> {
+        let mut items = Vec::new();
+        self.prepare_chapter_with(book, index, |item| items.push(item))?;
+        Ok(PreparedChapter {
+            styled: StyledChapter::from_items(items),
+        })
+    }
+
+    /// Prepare a chapter and append results into an output buffer.
+    pub fn prepare_chapter_into<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        book: &mut EpubBook<R>,
+        index: usize,
+        out: &mut Vec<StyledEventOrRun>,
+    ) -> Result<(), RenderPrepError> {
+        self.prepare_chapter_with(book, index, |item| out.push(item))
+    }
+
+    /// Prepare a chapter and stream each styled item via callback.
+    pub fn prepare_chapter_with<R: std::io::Read + std::io::Seek, F: FnMut(StyledEventOrRun)>(
+        &mut self,
+        book: &mut EpubBook<R>,
+        index: usize,
+        mut on_item: F,
+    ) -> Result<(), RenderPrepError> {
+        let html = book
+            .chapter_html(index)
+            .map_err(|e| RenderPrepError::new("BOOK_CHAPTER_HTML", e.to_string()))?;
+        let sources = book
+            .chapter_stylesheets_with_options(index, self.opts.style.limits)
+            .map_err(|e| RenderPrepError::new("BOOK_CHAPTER_STYLESHEETS", e.to_string()))?;
+        self.styler.load_stylesheets(&sources)?;
+        let font_resolver = &self.font_resolver;
+        self.styler.style_chapter_with(&html, |item| {
+            let (item, _) = resolve_item_with_font(font_resolver, item);
+            on_item(item);
+        })
+    }
+
+    /// Prepare a chapter and stream each styled item with structured trace context.
+    pub fn prepare_chapter_with_trace_context<
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(StyledEventOrRun, RenderPrepTrace),
+    >(
+        &mut self,
+        book: &mut EpubBook<R>,
+        index: usize,
+        mut on_item: F,
+    ) -> Result<(), RenderPrepError> {
+        let html = book
+            .chapter_html(index)
+            .map_err(|e| RenderPrepError::new("BOOK_CHAPTER_HTML", e.to_string()))?;
+        let sources = book
+            .chapter_stylesheets_with_options(index, self.opts.style.limits)
+            .map_err(|e| RenderPrepError::new("BOOK_CHAPTER_STYLESHEETS", e.to_string()))?;
+        self.styler.load_stylesheets(&sources)?;
+        let font_resolver = &self.font_resolver;
+        self.styler.style_chapter_with(&html, |item| {
+            let (item, trace) = resolve_item_with_font(font_resolver, item);
+            on_item(item, trace);
+        })
+    }
+
+    /// Prepare a chapter and stream each styled item with optional font-resolution trace.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use prepare_chapter_with_trace_context for stable structured trace output."
+    )]
+    pub fn prepare_chapter_with_trace<
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(StyledEventOrRun, Option<FontResolutionTrace>),
+    >(
+        &mut self,
+        book: &mut EpubBook<R>,
+        index: usize,
+        mut on_item: F,
+    ) -> Result<(), RenderPrepError> {
+        self.prepare_chapter_with_trace_context(book, index, |item, trace| {
+            on_item(item, trace.font_trace().cloned());
+        })
+    }
+}
+
+/// Prepared chapter stream returned by render-prep.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedChapter {
+    styled: StyledChapter,
+}
+
+impl PreparedChapter {
+    /// Iterate full styled stream.
+    pub fn iter(&self) -> impl Iterator<Item = &StyledEventOrRun> {
+        self.styled.iter()
+    }
+
+    /// Iterate styled runs.
+    pub fn runs(&self) -> impl Iterator<Item = &StyledRun> {
+        self.styled.runs()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ElementCtx {
+    tag: String,
+    classes: Vec<String>,
+    inline_style: Option<CssStyle>,
+}
+
+fn reader_token_offset(reader: &Reader<&[u8]>) -> usize {
+    usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX)
+}
+
+fn first_non_empty_declaration_index(style_attr: &str) -> Option<usize> {
+    style_attr
+        .split(';')
+        .enumerate()
+        .find(|(_, decl)| !decl.trim().is_empty())
+        .map(|(idx, _)| idx)
+}
+
+fn decode_tag_name(reader: &Reader<&[u8]>, raw: &[u8]) -> Result<String, RenderPrepError> {
+    reader
+        .decoder()
+        .decode(raw)
+        .map(|v| v.to_string())
+        .map_err(|err| {
+            RenderPrepError::new("STYLE_TOKENIZE_ERROR", format!("Decode error: {:?}", err))
+                .with_source("tag name decode")
+                .with_token_offset(reader_token_offset(reader))
+        })
+        .map(|tag| {
+            tag.rsplit(':')
+                .next()
+                .unwrap_or(tag.as_str())
+                .to_ascii_lowercase()
+        })
+}
+
+fn element_ctx_from_start(
+    reader: &Reader<&[u8]>,
+    e: &quick_xml::events::BytesStart<'_>,
+) -> Result<ElementCtx, RenderPrepError> {
+    let tag = decode_tag_name(reader, e.name().as_ref())?;
+    let mut classes = Vec::new();
+    let mut inline_style = None;
+    for attr in e.attributes().flatten() {
+        let key = match reader.decoder().decode(attr.key.as_ref()) {
+            Ok(v) => v.to_ascii_lowercase(),
+            Err(_) => continue,
+        };
+        let val = match reader.decoder().decode(&attr.value) {
+            Ok(v) => v.to_string(),
+            Err(_) => continue,
+        };
+        if key == "class" {
+            classes = val
+                .split_whitespace()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+        } else if key == "style" {
+            let parsed = parse_inline_style(&val).map_err(|err| {
+                let mut prep_err =
+                    RenderPrepError::new("STYLE_INLINE_PARSE_ERROR", err.to_string())
+                        .with_source(format!("inline style on <{}>", tag))
+                        .with_declaration(val.clone())
+                        .with_token_offset(reader_token_offset(reader));
+                if let Some(declaration_index) = first_non_empty_declaration_index(&val) {
+                    prep_err = prep_err.with_declaration_index(declaration_index);
+                }
+                prep_err
+            })?;
+            inline_style = Some(parsed);
+        }
+    }
+    Ok(ElementCtx {
+        tag,
+        classes,
+        inline_style,
+    })
+}
+
+fn emit_start_event<F: FnMut(StyledEventOrRun)>(tag: &str, on_item: &mut F) {
+    match tag {
+        "p" | "div" => on_item(StyledEventOrRun::Event(StyledEvent::ParagraphStart)),
+        "li" => on_item(StyledEventOrRun::Event(StyledEvent::ListItemStart)),
+        "h1" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(1))),
+        "h2" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(2))),
+        "h3" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(3))),
+        "h4" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(4))),
+        "h5" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(5))),
+        "h6" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingStart(6))),
+        _ => {}
+    }
+}
+
+fn emit_end_event<F: FnMut(StyledEventOrRun)>(tag: &str, on_item: &mut F) {
+    match tag {
+        "p" | "div" => on_item(StyledEventOrRun::Event(StyledEvent::ParagraphEnd)),
+        "li" => on_item(StyledEventOrRun::Event(StyledEvent::ListItemEnd)),
+        "h1" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(1))),
+        "h2" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(2))),
+        "h3" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(3))),
+        "h4" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(4))),
+        "h5" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(5))),
+        "h6" => on_item(StyledEventOrRun::Event(StyledEvent::HeadingEnd(6))),
+        _ => {}
+    }
+}
+
+fn role_from_tag(tag: &str) -> Option<BlockRole> {
+    match tag {
+        "p" | "div" => Some(BlockRole::Paragraph),
+        "li" => Some(BlockRole::ListItem),
+        "h1" => Some(BlockRole::Heading(1)),
+        "h2" => Some(BlockRole::Heading(2)),
+        "h3" => Some(BlockRole::Heading(3)),
+        "h4" => Some(BlockRole::Heading(4)),
+        "h5" => Some(BlockRole::Heading(5)),
+        "h6" => Some(BlockRole::Heading(6)),
+        _ => None,
+    }
+}
+
+fn should_skip_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "head" | "noscript")
+}
+
+fn is_preformatted_context(stack: &[ElementCtx]) -> bool {
+    stack.iter().any(|ctx| {
+        matches!(
+            ctx.tag.as_str(),
+            "pre" | "code" | "kbd" | "samp" | "textarea"
+        )
+    })
+}
+
+fn normalize_plain_text_whitespace(text: &str, preserve: bool) -> String {
+    if preserve {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                result.push(' ');
+                prev_space = true;
+            }
+        } else {
+            result.push(ch);
+            prev_space = false;
+        }
+    }
+    if result.ends_with(' ') {
+        result.pop();
+    }
+    result
+}
+
+fn normalize_family(family: &str) -> String {
+    family
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase()
+}
+
+fn has_non_ascii(text: &str) -> bool {
+    !text.is_ascii()
+}
+
+fn resolve_item_with_font(
+    font_resolver: &FontResolver,
+    item: StyledEventOrRun,
+) -> (StyledEventOrRun, RenderPrepTrace) {
+    match item {
+        StyledEventOrRun::Run(mut run) => {
+            let trace = font_resolver.resolve_with_trace_for_text(&run.style, Some(&run.text));
+            run.font_id = trace.face.font_id;
+            run.resolved_family = trace.face.family.clone();
+            let style = run.style.clone();
+            (
+                StyledEventOrRun::Run(run),
+                RenderPrepTrace::Run {
+                    style: Box::new(style),
+                    font: Box::new(trace),
+                },
+            )
+        }
+        StyledEventOrRun::Event(event) => (StyledEventOrRun::Event(event), RenderPrepTrace::Event),
+    }
+}
+
+fn split_family_stack(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|part| part.trim().trim_matches('"').trim_matches('\''))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+pub(crate) fn resolve_relative(base_path: &str, rel: &str) -> String {
+    if rel.contains("://") {
+        return rel.to_string();
+    }
+    if rel.starts_with('/') {
+        return normalize_path(rel.trim_start_matches('/'));
+    }
+    let base_dir = base_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    if base_dir.is_empty() {
+        normalize_path(rel)
+    } else {
+        normalize_path(&format!("{}/{}", base_dir, rel))
+    }
+}
+
+fn normalize_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+pub(crate) fn parse_stylesheet_links(chapter_href: &str, html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Reader::from_str(html);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let tag = match reader.decoder().decode(e.name().as_ref()) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => {
+                        buf.clear();
+                        continue;
+                    }
+                };
+                let tag_local = tag.rsplit(':').next().unwrap_or(tag.as_str());
+                if tag_local != "link" {
+                    buf.clear();
+                    continue;
+                }
+                let mut href = None;
+                let mut rel = None;
+                for attr in e.attributes().flatten() {
+                    let key = match reader.decoder().decode(attr.key.as_ref()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let val = match reader.decoder().decode(&attr.value) {
+                        Ok(v) => v.to_string(),
+                        Err(_) => continue,
+                    };
+                    if key == "href" {
+                        href = Some(val);
+                    } else if key == "rel" {
+                        rel = Some(val);
+                    }
+                }
+                if let (Some(href), Some(rel)) = (href, rel) {
+                    if rel
+                        .split_whitespace()
+                        .any(|v| v.eq_ignore_ascii_case("stylesheet"))
+                    {
+                        out.push(resolve_relative(chapter_href, &href));
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buf.clear();
+    }
+
+    out
+}
+
+fn font_src_rank(path: &str) -> u8 {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".ttf") || lower.ends_with(".otf") {
+        3
+    } else if lower.ends_with(".woff2") {
+        2
+    } else if lower.ends_with(".woff") {
+        1
+    } else {
+        0
+    }
+}
+
+fn extract_font_face_src(css_href: &str, src_value: &str) -> Option<String> {
+    let lower = src_value.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    let mut best: Option<(u8, String)> = None;
+
+    while let Some(idx) = lower[search_from..].find("url(") {
+        let start = search_from + idx + 4;
+        let tail = &src_value[start..];
+        let Some(end) = tail.find(')') else {
+            break;
+        };
+        let raw = tail[..end].trim().trim_matches('"').trim_matches('\'');
+        if !raw.is_empty() && !raw.starts_with("data:") {
+            let resolved = resolve_relative(css_href, raw);
+            let rank = font_src_rank(&resolved);
+            match &best {
+                Some((best_rank, _)) if *best_rank >= rank => {}
+                _ => best = Some((rank, resolved)),
+            }
+        }
+        search_from = start + end + 1;
+    }
+
+    best.map(|(_, path)| path)
+}
+
+pub(crate) fn parse_font_faces_from_css(css_href: &str, css: &str) -> Vec<EmbeddedFontFace> {
+    let mut out = Vec::new();
+    let lower = css.to_ascii_lowercase();
+    let mut search_from = 0usize;
+
+    while let Some(idx) = lower[search_from..].find("@font-face") {
+        let start = search_from + idx;
+        let block_start = match css[start..].find('{') {
+            Some(i) => start + i + 1,
+            None => break,
+        };
+        let block_end = match css[block_start..].find('}') {
+            Some(i) => block_start + i,
+            None => break,
+        };
+        let block = &css[block_start..block_end];
+
+        let mut family = None;
+        let mut weight = 400u16;
+        let mut style = EmbeddedFontStyle::Normal;
+        let mut stretch = None;
+        let mut href = None;
+        let mut format_hint = None;
+
+        for decl in block.split(';') {
+            let decl = decl.trim();
+            if decl.is_empty() {
+                continue;
+            }
+            let Some(colon) = decl.find(':') else {
+                continue;
+            };
+            let key = decl[..colon].trim().to_ascii_lowercase();
+            let value = decl[colon + 1..].trim();
+            match key.as_str() {
+                "font-family" => {
+                    let val = value.trim_matches('"').trim_matches('\'').trim();
+                    if !val.is_empty() {
+                        family = Some(val.to_string());
+                    }
+                }
+                "font-weight" => {
+                    let lower = value.to_ascii_lowercase();
+                    weight = if lower == "bold" {
+                        700
+                    } else if lower == "normal" {
+                        400
+                    } else {
+                        lower.parse::<u16>().unwrap_or(400)
+                    };
+                }
+                "font-style" => {
+                    let lower = value.to_ascii_lowercase();
+                    style = if lower == "italic" {
+                        EmbeddedFontStyle::Italic
+                    } else if lower == "oblique" {
+                        EmbeddedFontStyle::Oblique
+                    } else {
+                        EmbeddedFontStyle::Normal
+                    };
+                }
+                "font-stretch" => {
+                    if !value.is_empty() {
+                        stretch = Some(value.to_string());
+                    }
+                }
+                "src" => {
+                    href = extract_font_face_src(css_href, value);
+                    if let Some(fmt_idx) = value.to_ascii_lowercase().find("format(") {
+                        let fmt_tail = &value[fmt_idx + 7..];
+                        if let Some(end_paren) = fmt_tail.find(')') {
+                            let raw = fmt_tail[..end_paren]
+                                .trim()
+                                .trim_matches('"')
+                                .trim_matches('\'');
+                            if !raw.is_empty() {
+                                format_hint = Some(raw.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(family), Some(href)) = (family, href) {
+            out.push(EmbeddedFontFace {
+                family,
+                weight,
+                style,
+                stretch,
+                href,
+                format: format_hint,
+            });
+        }
+
+        search_from = block_end + 1;
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_tag_retains_semantic_elements() {
+        assert!(!should_skip_tag("nav"));
+        assert!(!should_skip_tag("header"));
+        assert!(!should_skip_tag("footer"));
+        assert!(!should_skip_tag("aside"));
+        assert!(should_skip_tag("script"));
+    }
+
+    #[test]
+    fn normalize_whitespace_preserves_preformatted_context() {
+        let s = "a\n  b\t c";
+        assert_eq!(normalize_plain_text_whitespace(s, true), s);
+        assert_eq!(normalize_plain_text_whitespace(s, false), "a b c");
+    }
+
+    #[test]
+    fn parse_stylesheet_links_resolves_relative_paths() {
+        let html = r#"<html><head>
+<link rel="stylesheet" href="../styles/base.css"/>
+<link rel="alternate stylesheet" href="theme.css"/>
+</head></html>"#;
+        let links = parse_stylesheet_links("text/ch1.xhtml", html);
+        assert_eq!(links, vec!["styles/base.css", "text/theme.css"]);
+    }
+
+    #[test]
+    fn parse_font_faces_prefers_ttf_otf_sources() {
+        let css = r#"
+@font-face {
+  font-family: "Test";
+  src: local("Test"), url("../fonts/test.woff2") format("woff2"), url("../fonts/test.ttf") format("truetype");
+}
+"#;
+        let faces = parse_font_faces_from_css("styles/main.css", css);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].href, "fonts/test.ttf");
+    }
+
+    #[test]
+    fn parse_font_faces_extracts_basic_metadata() {
+        let css = r#"
+@font-face {
+  font-family: 'Literata';
+  font-style: italic;
+  font-weight: 700;
+  src: url('../fonts/Literata-Italic.woff2') format('woff2');
+}
+"#;
+        let faces = parse_font_faces_from_css("styles/main.css", css);
+        assert_eq!(faces.len(), 1);
+        let face = &faces[0];
+        assert_eq!(face.family, "Literata");
+        assert_eq!(face.weight, 700);
+        assert_eq!(face.style, EmbeddedFontStyle::Italic);
+        assert_eq!(face.href, "fonts/Literata-Italic.woff2");
+        assert_eq!(face.format.as_deref(), Some("woff2"));
+    }
+
+    #[test]
+    fn styler_emits_runs_for_text() {
+        let mut styler = Styler::new(StyleConfig::default());
+        styler
+            .load_stylesheets(&ChapterStylesheets::default())
+            .expect("load should succeed");
+        let chapter = styler
+            .style_chapter("<h1>Title</h1><p>Hello world</p>")
+            .expect("style should succeed");
+        assert!(chapter.runs().count() >= 2);
+    }
+
+    #[test]
+    fn styler_style_chapter_with_streams_items() {
+        let mut styler = Styler::new(StyleConfig::default());
+        styler
+            .load_stylesheets(&ChapterStylesheets::default())
+            .expect("load should succeed");
+        let mut seen = 0usize;
+        styler
+            .style_chapter_with("<p>Hello</p>", |_item| {
+                seen += 1;
+            })
+            .expect("style_chapter_with should succeed");
+        assert!(seen > 0);
+    }
+
+    #[test]
+    fn styler_applies_class_and_inline_style() {
+        let mut styler = Styler::new(StyleConfig::default());
+        styler
+            .load_stylesheets(&ChapterStylesheets {
+                sources: vec![StylesheetSource {
+                    href: "main.css".to_string(),
+                    css: ".intro { font-size: 20px; font-style: normal; }".to_string(),
+                }],
+            })
+            .expect("load should succeed");
+        let chapter = styler
+            .style_chapter("<p class=\"intro\" style=\"font-style: italic\">Hello</p>")
+            .expect("style should succeed");
+        let first = chapter.runs().next().expect("expected run");
+        assert_eq!(first.style.size_px, 20.0);
+        assert!(first.style.italic);
+    }
+
+    #[test]
+    fn styler_respects_stylesheet_precedence_order() {
+        let mut styler = Styler::new(StyleConfig::default());
+        styler
+            .load_stylesheets(&ChapterStylesheets {
+                sources: vec![
+                    StylesheetSource {
+                        href: "a.css".to_string(),
+                        css: "p { font-size: 12px; }".to_string(),
+                    },
+                    StylesheetSource {
+                        href: "b.css".to_string(),
+                        css: "p { font-size: 18px; }".to_string(),
+                    },
+                ],
+            })
+            .expect("load should succeed");
+        let chapter = styler
+            .style_chapter("<p>Hello</p>")
+            .expect("style should succeed");
+        let first = chapter.runs().next().expect("expected run");
+        assert_eq!(first.style.size_px, 18.0);
+    }
+
+    #[test]
+    fn styler_enforces_css_byte_limit() {
+        let mut styler = Styler::new(StyleConfig {
+            limits: StyleLimits {
+                max_css_bytes: 4,
+                ..StyleLimits::default()
+            },
+            hints: LayoutHints::default(),
+        });
+        let styles = ChapterStylesheets {
+            sources: vec![StylesheetSource {
+                href: "a.css".to_string(),
+                css: "p { font-weight: bold; }".to_string(),
+            }],
+        };
+        let err = styler.load_stylesheets(&styles).expect_err("should reject");
+        assert_eq!(err.code, "STYLE_CSS_TOO_LARGE");
+    }
+
+    #[test]
+    fn styler_enforces_selector_limit() {
+        let mut styler = Styler::new(StyleConfig {
+            limits: StyleLimits {
+                max_selectors: 1,
+                ..StyleLimits::default()
+            },
+            hints: LayoutHints::default(),
+        });
+        let styles = ChapterStylesheets {
+            sources: vec![StylesheetSource {
+                href: "a.css".to_string(),
+                css: "p { font-weight: bold; } h1 { font-style: italic; }".to_string(),
+            }],
+        };
+        let err = styler.load_stylesheets(&styles).expect_err("should reject");
+        assert_eq!(err.code, "STYLE_SELECTOR_LIMIT");
+        let ctx = err.context.expect("expected context");
+        assert_eq!(ctx.selector_index, Some(1));
+    }
+
+    #[test]
+    fn style_tokenize_error_sets_token_offset_context() {
+        let mut styler = Styler::new(StyleConfig::default());
+        styler
+            .load_stylesheets(&ChapterStylesheets::default())
+            .expect("load should succeed");
+        let err = styler
+            .style_chapter("<p class=\"x></p>")
+            .expect_err("should reject malformed xml");
+        assert_eq!(err.code, "STYLE_TOKENIZE_ERROR");
+        let ctx = err.context.expect("expected context");
+        assert!(ctx.token_offset.is_some());
+    }
+
+    #[test]
+    fn render_prep_error_context_supports_typed_indices() {
+        let err = RenderPrepError::new("TEST", "typed context")
+            .with_selector_index(3)
+            .with_declaration_index(1)
+            .with_token_offset(9);
+        let ctx = err.context.expect("expected context");
+        assert_eq!(ctx.selector_index, Some(3));
+        assert_eq!(ctx.declaration_index, Some(1));
+        assert_eq!(ctx.token_offset, Some(9));
+    }
+
+    #[test]
+    fn font_resolver_trace_reports_fallback_chain() {
+        let resolver = FontResolver::new(FontPolicy::serif_default());
+        let style = ComputedTextStyle {
+            family_stack: vec!["A".to_string(), "B".to_string()],
+            weight: 400,
+            italic: false,
+            size_px: 16.0,
+            line_height: 1.4,
+            letter_spacing: 0.0,
+            block_role: BlockRole::Body,
+        };
+        let trace = resolver.resolve_with_trace(&style);
+        assert_eq!(trace.face.family, "serif");
+        assert!(trace.reason_chain.len() >= 2);
+    }
+
+    #[test]
+    fn font_resolver_chooses_nearest_weight_and_style() {
+        let mut resolver = FontResolver::new(FontPolicy::serif_default());
+        let faces = vec![
+            EmbeddedFontFace {
+                family: "Literata".to_string(),
+                weight: 400,
+                style: EmbeddedFontStyle::Normal,
+                stretch: None,
+                href: "a.ttf".to_string(),
+                format: None,
+            },
+            EmbeddedFontFace {
+                family: "Literata".to_string(),
+                weight: 700,
+                style: EmbeddedFontStyle::Italic,
+                stretch: None,
+                href: "b.ttf".to_string(),
+                format: None,
+            },
+        ];
+        resolver
+            .register_epub_fonts(faces, |_href| Ok(vec![1, 2, 3]))
+            .expect("register should succeed");
+        let style = ComputedTextStyle {
+            family_stack: vec!["Literata".to_string()],
+            weight: 680,
+            italic: true,
+            size_px: 16.0,
+            line_height: 1.4,
+            letter_spacing: 0.0,
+            block_role: BlockRole::Body,
+        };
+        let trace = resolver.resolve_with_trace(&style);
+        let chosen = trace.face.embedded.expect("should match embedded");
+        assert_eq!(chosen.href, "b.ttf");
+    }
+
+    #[test]
+    fn font_resolver_reports_missing_glyph_risk_for_non_ascii_fallback() {
+        let resolver = FontResolver::new(FontPolicy::serif_default());
+        let style = ComputedTextStyle {
+            family_stack: vec!["NoSuchFamily".to_string()],
+            weight: 400,
+            italic: false,
+            size_px: 16.0,
+            line_height: 1.4,
+            letter_spacing: 0.0,
+            block_role: BlockRole::Body,
+        };
+        let trace = resolver.resolve_with_trace_for_text(&style, Some("Привет"));
+        assert!(trace
+            .reason_chain
+            .iter()
+            .any(|v| v.contains("missing glyph risk")));
+    }
+
+    #[test]
+    fn font_resolver_deduplicates_faces() {
+        let mut resolver = FontResolver::new(FontPolicy::serif_default()).with_limits(FontLimits {
+            max_faces: 8,
+            ..FontLimits::default()
+        });
+        let face = EmbeddedFontFace {
+            family: "Literata".to_string(),
+            weight: 400,
+            style: EmbeddedFontStyle::Normal,
+            stretch: None,
+            href: "a.ttf".to_string(),
+            format: None,
+        };
+        resolver
+            .register_epub_fonts(vec![face.clone(), face], |_href| Ok(vec![1, 2, 3]))
+            .expect("register should succeed");
+        let style = ComputedTextStyle {
+            family_stack: vec!["Literata".to_string()],
+            weight: 400,
+            italic: false,
+            size_px: 16.0,
+            line_height: 1.4,
+            letter_spacing: 0.0,
+            block_role: BlockRole::Body,
+        };
+        let trace = resolver.resolve_with_trace(&style);
+        assert!(trace.face.embedded.is_some());
+    }
+
+    #[test]
+    fn font_resolver_register_rejects_too_many_faces() {
+        let mut resolver = FontResolver::new(FontPolicy::serif_default()).with_limits(FontLimits {
+            max_faces: 1,
+            ..FontLimits::default()
+        });
+        let faces = vec![
+            EmbeddedFontFace {
+                family: "A".to_string(),
+                weight: 400,
+                style: EmbeddedFontStyle::Normal,
+                stretch: None,
+                href: "a.ttf".to_string(),
+                format: None,
+            },
+            EmbeddedFontFace {
+                family: "B".to_string(),
+                weight: 400,
+                style: EmbeddedFontStyle::Normal,
+                stretch: None,
+                href: "b.ttf".to_string(),
+                format: None,
+            },
+        ];
+        let err = resolver
+            .register_epub_fonts(faces, |_href| Ok(vec![1, 2, 3]))
+            .expect_err("should reject");
+        assert_eq!(err.code, "FONT_FACE_LIMIT");
+    }
+
+    #[test]
+    fn render_prep_with_registered_fonts_uses_external_loader() {
+        let called = std::cell::Cell::new(0usize);
+        let prep = RenderPrep::new(RenderPrepOptions::default()).with_registered_fonts(
+            vec![EmbeddedFontFace {
+                family: "Custom".to_string(),
+                weight: 400,
+                style: EmbeddedFontStyle::Normal,
+                stretch: None,
+                href: "fonts/custom.ttf".to_string(),
+                format: Some("truetype".to_string()),
+            }],
+            |href| {
+                assert_eq!(href, "fonts/custom.ttf");
+                called.set(called.get() + 1);
+                Ok(vec![1, 2, 3, 4])
+            },
+        );
+        assert!(prep.is_ok());
+        assert_eq!(called.get(), 1);
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "mu-epub-embedded-graphics"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "embedded-graphics backend for mu-epub-render"
+
+[features]
+default = []
+ttf-backend = []
+
+[dependencies]
+mu-epub-render = { path = "../mu-epub-render" }
+embedded-graphics = "0.8"

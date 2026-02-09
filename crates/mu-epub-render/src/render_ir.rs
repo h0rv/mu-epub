@@ -1,0 +1,517 @@
+use mu_epub::BlockRole;
+
+/// Page represented as backend-agnostic draw commands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RenderPage {
+    /// 1-based page number.
+    pub page_number: usize,
+    /// Legacy merged command stream.
+    ///
+    /// This remains for compatibility and is kept in sync with
+    /// `content_commands`, `chrome_commands`, and `overlay_commands`.
+    pub commands: Vec<DrawCommand>,
+    /// Content-layer draw commands (deterministic pagination output).
+    pub content_commands: Vec<DrawCommand>,
+    /// Chrome-layer draw commands (header/footer/progress and similar).
+    pub chrome_commands: Vec<DrawCommand>,
+    /// Overlay draw commands attached after content/chrome layout.
+    pub overlay_commands: Vec<DrawCommand>,
+    /// Structured overlay items attached by composer APIs.
+    pub overlay_items: Vec<OverlayItem>,
+    /// Structured non-draw annotations associated with this page.
+    pub annotations: Vec<PageAnnotation>,
+    /// Per-page metrics for navigation/progress consumers.
+    pub metrics: PageMetrics,
+}
+
+impl RenderPage {
+    /// Create an empty page.
+    pub fn new(page_number: usize) -> Self {
+        Self {
+            page_number,
+            commands: Vec::new(),
+            content_commands: Vec::new(),
+            chrome_commands: Vec::new(),
+            overlay_commands: Vec::new(),
+            overlay_items: Vec::new(),
+            annotations: Vec::new(),
+            metrics: PageMetrics {
+                chapter_page_index: page_number.saturating_sub(1),
+                ..PageMetrics::default()
+            },
+        }
+    }
+
+    /// Push a content-layer command.
+    pub fn push_content_command(&mut self, cmd: DrawCommand) {
+        self.content_commands.push(cmd);
+    }
+
+    /// Push a chrome-layer command.
+    pub fn push_chrome_command(&mut self, cmd: DrawCommand) {
+        self.chrome_commands.push(cmd);
+    }
+
+    /// Push an overlay-layer command.
+    pub fn push_overlay_command(&mut self, cmd: DrawCommand) {
+        self.overlay_commands.push(cmd);
+    }
+
+    /// Rebuild legacy merged `commands` from split layers.
+    pub fn sync_commands(&mut self) {
+        self.commands.clear();
+        self.commands.extend(self.content_commands.iter().cloned());
+        self.commands.extend(self.chrome_commands.iter().cloned());
+        self.commands.extend(self.overlay_commands.iter().cloned());
+    }
+}
+
+/// Structured page annotation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageAnnotation {
+    /// Stable annotation kind/tag.
+    pub kind: String,
+    /// Optional annotation payload.
+    pub value: Option<String>,
+}
+
+/// Structured page metrics for progress and navigation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PageMetrics {
+    /// Chapter index in the spine (0-based), when known.
+    pub chapter_index: usize,
+    /// Page index in chapter (0-based).
+    pub chapter_page_index: usize,
+    /// Total pages in chapter, when known.
+    pub chapter_page_count: Option<usize>,
+    /// Global page index across rendered stream (0-based), when known.
+    pub global_page_index: Option<usize>,
+    /// Estimated global page count, when known.
+    pub global_page_count_estimate: Option<usize>,
+    /// Chapter progress in range `[0.0, 1.0]`.
+    pub progress_chapter: f32,
+    /// Book progress in range `[0.0, 1.0]`, when known.
+    pub progress_book: Option<f32>,
+}
+
+/// Stable pagination profile id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaginationProfileId(pub [u8; 32]);
+
+impl PaginationProfileId {
+    /// Build a deterministic profile id from arbitrary payload bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        fn fnv64(seed: u64, payload: &[u8]) -> u64 {
+            let mut hash = seed;
+            for b in payload {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
+        let mut out = [0u8; 32];
+        let h0 = fnv64(0xcbf29ce484222325, bytes).to_le_bytes();
+        let h1 = fnv64(0x9e3779b97f4a7c15, bytes).to_le_bytes();
+        let h2 = fnv64(0xd6e8feb86659fd93, bytes).to_le_bytes();
+        let h3 = fnv64(0xa0761d6478bd642f, bytes).to_le_bytes();
+        out[0..8].copy_from_slice(&h0);
+        out[8..16].copy_from_slice(&h1);
+        out[16..24].copy_from_slice(&h2);
+        out[24..32].copy_from_slice(&h3);
+        Self(out)
+    }
+}
+
+/// Logical overlay slots for app/UI composition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverlaySlot {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+    Custom(OverlayRect),
+}
+
+/// Logical viewport size for overlay composition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlaySize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Rectangle for custom overlay slot coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlayRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Overlay content payload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverlayContent {
+    /// Text payload (resolved by the app/backend).
+    Text(String),
+    /// Backend-agnostic draw command payload.
+    Command(DrawCommand),
+}
+
+/// Overlay item attached to a page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayItem {
+    /// Destination slot.
+    pub slot: OverlaySlot,
+    /// Z-order.
+    pub z: i32,
+    /// Overlay payload.
+    pub content: OverlayContent,
+}
+
+/// Overlay composer API for app-driven overlay placement/content.
+pub trait OverlayComposer {
+    fn compose(&self, metrics: &PageMetrics, viewport: OverlaySize) -> Vec<OverlayItem>;
+}
+
+/// Layout output commands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DrawCommand {
+    /// Draw text.
+    Text(TextCommand),
+    /// Draw a line rule.
+    Rule(RuleCommand),
+    /// Draw rectangle.
+    Rect(RectCommand),
+    /// Draw page metadata/chrome.
+    PageChrome(PageChromeCommand),
+}
+
+/// Theme-aware render intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderIntent {
+    /// Convert output to grayscale mode.
+    pub grayscale_mode: GrayscaleMode,
+    /// Optional dithering algorithm.
+    pub dither: DitherMode,
+    /// Contrast multiplier in percent (100 = neutral).
+    pub contrast_boost: u8,
+}
+
+impl Default for RenderIntent {
+    fn default() -> Self {
+        Self {
+            grayscale_mode: GrayscaleMode::Off,
+            dither: DitherMode::None,
+            contrast_boost: 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrayscaleMode {
+    Off,
+    Luminosity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DitherMode {
+    None,
+    Ordered,
+    ErrorDiffusion,
+}
+
+/// Resolved style passed to renderer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedTextStyle {
+    /// Stable font identifier for this style.
+    pub font_id: Option<u32>,
+    /// Chosen family.
+    pub family: String,
+    /// Numeric weight.
+    pub weight: u16,
+    /// Italic flag.
+    pub italic: bool,
+    /// Size in pixels.
+    pub size_px: f32,
+    /// Line height multiplier.
+    pub line_height: f32,
+    /// Letter spacing in px.
+    pub letter_spacing: f32,
+    /// Semantic role.
+    pub role: BlockRole,
+    /// Justification mode from layout.
+    pub justify_mode: JustifyMode,
+}
+
+/// Justification mode determined during layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JustifyMode {
+    /// Left/no justification.
+    None,
+    /// Inter-word with total extra px to distribute.
+    InterWord { extra_px_total: i32 },
+}
+
+/// Text draw command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextCommand {
+    /// Left x.
+    pub x: i32,
+    /// Baseline y.
+    pub baseline_y: i32,
+    /// Content.
+    pub text: String,
+    /// Font identifier for direct command-level lookup.
+    pub font_id: Option<u32>,
+    /// Resolved style.
+    pub style: ResolvedTextStyle,
+}
+
+/// Rule draw command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleCommand {
+    /// Start x.
+    pub x: i32,
+    /// Start y.
+    pub y: i32,
+    /// Length.
+    pub length: u32,
+    /// Thickness.
+    pub thickness: u32,
+    /// Horizontal if true; vertical if false.
+    pub horizontal: bool,
+}
+
+/// Rectangle command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RectCommand {
+    /// Left x.
+    pub x: i32,
+    /// Top y.
+    pub y: i32,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+    /// Fill rectangle when true.
+    pub fill: bool,
+}
+
+/// Page-level metadata/chrome marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageChromeCommand {
+    /// Semantic chrome kind.
+    pub kind: PageChromeKind,
+    /// Optional text payload (e.g. footer text).
+    pub text: Option<String>,
+    /// Optional current value (e.g. for progress).
+    pub current: Option<usize>,
+    /// Optional total value (e.g. for progress).
+    pub total: Option<usize>,
+}
+
+/// Kind of page-level metadata/chrome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageChromeKind {
+    /// Header marker.
+    Header,
+    /// Footer marker.
+    Footer,
+    /// Progress marker.
+    Progress,
+}
+
+/// Text style for header/footer chrome rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageChromeTextStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+/// Shared page-chrome policy and geometry configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageChromeConfig {
+    /// Emit/draw page header text.
+    pub header_enabled: bool,
+    /// Emit/draw page footer text.
+    pub footer_enabled: bool,
+    /// Emit/draw page progress bar.
+    pub progress_enabled: bool,
+    /// Header text left x.
+    pub header_x: i32,
+    /// Header text baseline y.
+    pub header_baseline_y: i32,
+    /// Header text style.
+    pub header_style: PageChromeTextStyle,
+    /// Footer text left x.
+    pub footer_x: i32,
+    /// Footer text baseline offset from bottom edge.
+    pub footer_baseline_from_bottom: i32,
+    /// Footer text style.
+    pub footer_style: PageChromeTextStyle,
+    /// Progress bar left/right inset.
+    pub progress_x_inset: i32,
+    /// Progress bar top y offset from bottom edge.
+    pub progress_y_from_bottom: i32,
+    /// Progress bar height.
+    pub progress_height: u32,
+    /// Progress bar outline thickness.
+    pub progress_stroke_width: u32,
+}
+
+impl PageChromeConfig {
+    /// Default chrome geometry matching historical renderer behavior.
+    pub const fn geometry_defaults() -> Self {
+        Self {
+            header_enabled: true,
+            footer_enabled: true,
+            progress_enabled: true,
+            header_x: 8,
+            header_baseline_y: 16,
+            header_style: PageChromeTextStyle::Bold,
+            footer_x: 8,
+            footer_baseline_from_bottom: 8,
+            footer_style: PageChromeTextStyle::Regular,
+            progress_x_inset: 8,
+            progress_y_from_bottom: 20,
+            progress_height: 4,
+            progress_stroke_width: 1,
+        }
+    }
+
+    /// Defaults used by layout so chrome markers are opt-in.
+    pub const fn layout_defaults() -> Self {
+        let mut cfg = Self::geometry_defaults();
+        cfg.header_enabled = false;
+        cfg.footer_enabled = false;
+        cfg.progress_enabled = false;
+        cfg
+    }
+}
+
+impl Default for PageChromeConfig {
+    fn default() -> Self {
+        Self::layout_defaults()
+    }
+}
+
+/// Typography policy knobs for layout behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TypographyConfig {
+    /// Hyphenation policy.
+    pub hyphenation: HyphenationConfig,
+    /// Widow/orphan control policy.
+    pub widow_orphan_control: WidowOrphanControl,
+    /// Justification policy.
+    pub justification: JustificationConfig,
+    /// Hanging punctuation policy.
+    pub hanging_punctuation: HangingPunctuationConfig,
+}
+
+/// Hyphenation behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HyphenationConfig {
+    /// Soft-hyphen handling policy.
+    pub soft_hyphen_policy: HyphenationMode,
+}
+
+impl Default for HyphenationConfig {
+    fn default() -> Self {
+        Self {
+            soft_hyphen_policy: HyphenationMode::Discretionary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HyphenationMode {
+    Ignore,
+    Discretionary,
+}
+
+/// Widow/orphan policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidowOrphanControl {
+    /// Keep at least this many lines at paragraph start/end when possible.
+    pub min_lines: u8,
+    /// Enable widow/orphan controls.
+    pub enabled: bool,
+}
+
+impl Default for WidowOrphanControl {
+    fn default() -> Self {
+        Self {
+            min_lines: 1,
+            enabled: false,
+        }
+    }
+}
+
+/// Justification policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JustificationConfig {
+    /// Enable inter-word justification.
+    pub enabled: bool,
+    /// Minimum words required for justification.
+    pub min_words: usize,
+    /// Minimum fill ratio required for justification.
+    pub min_fill_ratio: f32,
+}
+
+impl Default for JustificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_words: 7,
+            min_fill_ratio: 0.75,
+        }
+    }
+}
+
+/// Hanging punctuation policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HangingPunctuationConfig {
+    /// Enable hanging punctuation (currently informational).
+    pub enabled: bool,
+}
+
+/// Non-text object layout policy knobs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectLayoutConfig {
+    /// Max inline-image height ratio relative to content height.
+    pub max_inline_image_height_ratio: f32,
+    /// Enable/disable float placement.
+    pub float_support: FloatSupport,
+    /// SVG placement mode.
+    pub svg_mode: SvgMode,
+    /// Emit alt-text fallback when object drawing is unavailable.
+    pub alt_text_fallback: bool,
+}
+
+impl Default for ObjectLayoutConfig {
+    fn default() -> Self {
+        Self {
+            max_inline_image_height_ratio: 0.5,
+            float_support: FloatSupport::None,
+            svg_mode: SvgMode::RasterizeFallback,
+            alt_text_fallback: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatSupport {
+    None,
+    Basic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvgMode {
+    Ignore,
+    RasterizeFallback,
+    Native,
+}

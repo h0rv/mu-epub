@@ -1,0 +1,19 @@
+# pattern<TAB>expected<TAB>required_codes(optional comma-separated)<TAB>note(optional)
+# expected values: valid | invalid
+# First matching rule wins; default is `valid`.
+#
+# Keep this list explicit and curated. EPUBCheck fixture filenames may include
+# "-error" or "-fatal" while still being parseable by this project's current
+# validator scope.
+
+# Known intentionally-invalid fixtures that should fail with current validator:
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-container-not-ocf-error.epub	invalid	OCF_INVALID_MIMETYPE,OCF_CONTAINER_XML_MISSING
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-mimetype-file-missing-error.epub	invalid	OCF_INVALID_MIMETYPE
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-zip-unreadable-empty-fatal.epub	invalid	ZIP_INVALID_ARCHIVE
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-zip-unreadable-image-with-epub-extension-fatal.epub	invalid	ZIP_INVALID_ARCHIVE
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-zip-unreadable-no-end-header-fatal.epub	invalid	ZIP_INVALID_ARCHIVE
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-filename-character-forbidden-error.epub	invalid	MANIFEST_RESOURCE_MISSING
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-filename-duplicate-after-canonical-normalization-error.epub	invalid	MANIFEST_RESOURCE_MISSING
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-filename-duplicate-after-compatibility-normalization-valid.epub	invalid	MANIFEST_RESOURCE_MISSING
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-filename-not-utf8-error.epub	invalid	MANIFEST_RESOURCE_MISSING
+conformance/epubcheck/src/test/resources/epub3/04-ocf/files/ocf-filepath-not-utf8-error.epub	invalid	MANIFEST_RESOURCE_MISSING
