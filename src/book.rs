@@ -28,7 +28,7 @@ use crate::render_prep::{
 };
 use crate::spine::Spine;
 use crate::tokenizer::{tokenize_html, Token};
-use crate::zip::{StreamingZip, ZipLimits};
+use crate::zip::{CdEntry, StreamingZip, ZipLimits};
 
 /// Validation strictness for high-level open/parse flows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1127,13 +1127,30 @@ fn read_entry_into_with_limit<R: Read + Seek, W: Write>(
     writer: &mut W,
     max_bytes: usize,
 ) -> Result<usize, EpubError> {
-    let entry = zip
-        .get_entry(path)
-        .cloned()
-        .ok_or(EpubError::Zip(ZipError::FileNotFound))?;
-    if entry.uncompressed_size as usize > max_bytes || entry.compressed_size as usize > max_bytes {
+    let (method, compressed_size, uncompressed_size, local_header_offset, crc32) = {
+        let entry = zip
+            .get_entry(path)
+            .ok_or(EpubError::Zip(ZipError::FileNotFound))?;
+        (
+            entry.method,
+            entry.compressed_size,
+            entry.uncompressed_size,
+            entry.local_header_offset,
+            entry.crc32,
+        )
+    };
+
+    if uncompressed_size as usize > max_bytes || compressed_size as usize > max_bytes {
         return Err(EpubError::Zip(ZipError::FileTooLarge));
     }
+    let entry = CdEntry {
+        method,
+        compressed_size,
+        uncompressed_size,
+        local_header_offset,
+        crc32,
+        filename: String::new(),
+    };
     zip.read_file_to_writer(&entry, writer)
         .map_err(EpubError::Zip)
 }

@@ -315,10 +315,12 @@ impl<F: Read + Seek> StreamingZip<F> {
 
     /// Get entry by filename (case-insensitive)
     pub fn get_entry(&self, name: &str) -> Option<&CdEntry> {
-        let name_lower = name.to_lowercase();
-        self.entries
-            .iter()
-            .find(|e| e.filename.to_lowercase() == name_lower)
+        self.entries.iter().find(|e| {
+            e.filename == name
+                || e.filename.eq_ignore_ascii_case(name)
+                || (name.starts_with('/') && e.filename.eq_ignore_ascii_case(&name[1..]))
+                || (e.filename.starts_with('/') && e.filename[1..].eq_ignore_ascii_case(name))
+        })
     }
 
     /// Debug: Log all entries in the ZIP (for troubleshooting)
